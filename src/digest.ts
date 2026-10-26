@@ -53,6 +53,28 @@ function isRateLimit(msg: string) {
     return /429|rate.?limit|too many requests/i.test(msg);
 }
 
+/** 把 RestAPI 抛出来的各种东西（字符串 / Error / {status, body}）都转成人能看的文本 */
+function errInfo(e: any): { status?: number; text: string; } {
+    if (e == null) return { text: "null" };
+    if (typeof e === "string") return { status: undefined, text: e };
+    if (typeof e === "number") return { status: e, text: String(e) };
+
+    const status: number | undefined = e.status ?? e.statusCode ?? e.code;
+    let body = "";
+    try {
+        body = typeof e.body === "string" ? e.body : JSON.stringify(e.body ?? "");
+    } catch { body = "<unserializable>"; }
+
+    const parts = [
+        status != null ? `status=${status}` : "",
+        e.message ? `msg=${e.message}` : "",
+        body && body !== '""' ? `body=${body.slice(0, 180)}` : "",
+        Object.keys(e).length ? `keys=${Object.keys(e).join(",")}` : ""
+    ].filter(Boolean);
+
+    return { status, text: parts.join(" ") || String(e) };
+}
+
 /** 带重试与退避的 GET，专治 429 */
 async function getWithRetry(url: string, query?: Record<string, any>): Promise<any> {
     for (let attempt = 0; attempt < RETRY_TIMES; attempt++) {
@@ -69,13 +91,18 @@ async function getWithRetry(url: string, query?: Record<string, any>): Promise<a
             }
             return res;
         } catch (e: any) {
-            const msg = String(e?.message ?? e ?? "");
-            logger.warn(`请求失败(${attempt + 1}/${RETRY_TIMES}) ${url} :: ${msg.slice(0, 120)}`);
-            if (isRateLimit(msg) && attempt < RETRY_TIMES - 1) {
+            const info = errInfo(e);
+            logger.warn(`请求失败(${attempt + 1}/${RETRY_TIMES}) ${url} :: ${info.text.slice(0, 200)}`);
+
+            const rateLimited = info.status === 429 || isRateLimit(info.text);
+            if (rateLimited && attempt < RETRY_TIMES - 1) {
                 await sleep(1200 * (attempt + 1));
                 continue;
             }
-            throw e;
+            // 404/403 之类的确定失败，把状态码带出去，别重试
+            const err: any = new Error(info.text);
+            err.status = info.status;
+            throw err;
         }
     }
     return { status: 0, body: null };
@@ -161,16 +188,34 @@ async function resolveRef(msg: any, guildId: string): Promise<DigestItem["ref"]>
     } catch { /* ignore */ }
 
     // 3) 单独请求（带重试）
+    let status: number | undefined;
     try {
         await sleep(REF_DELAY_MS);
         const res = await getWithRetry(`/channels/${refChannelId}/messages/${ref.message_id}`);
         if (res?.status === 200 && res.body) return build(res.body);
-        logger.warn(`引用拿不到 ${ref.message_id} status=${res?.status}`);
-    } catch (e) {
-        logger.warn("引用请求异常", ref.message_id, e);
+        status = res?.status;
+        logger.warn(`引用单条拿不到 ${ref.message_id} status=${status}`);
+    } catch (e: any) {
+        status = e?.status;
+        logger.warn(`引用单条异常 ${ref.message_id} :: ${errInfo(e).text.slice(0, 160)}`);
     }
 
-    return { author: "（原消息不可见）", content: "可能已被删除，或你没有该频道的权限" };
+    // 4) 兜底：拉这个 id 周围的消息，从里面找（换个路由，有时单条接口不行但这个可以）
+    try {
+        await sleep(REF_DELAY_MS);
+        const res = await getWithRetry(`/channels/${refChannelId}/messages`, { around: ref.message_id, limit: 5 });
+        const list: any[] = Array.isArray(res?.body) ? res.body : [];
+        const found = list.find(m => m?.id === ref.message_id);
+        if (found) return build(found);
+        logger.warn(`引用 around 兜底也没找到 ${ref.message_id}（拿到 ${list.length} 条）`);
+    } catch (e: any) {
+        logger.warn(`引用 around 兜底异常 ${ref.message_id} :: ${errInfo(e).text.slice(0, 160)}`);
+    }
+
+    return {
+        author: "（原消息不可见）",
+        content: status ? `可能已被删除，或你没有该频道的权限（HTTP ${status}）` : "可能已被删除，或你没有该频道的权限"
+    };
 }
 
 function buildDigestHtml(user: { name: string; id: string; }, items: DigestItem[], hours: number): string {
