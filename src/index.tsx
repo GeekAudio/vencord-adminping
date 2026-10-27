@@ -102,8 +102,13 @@ const settings = definePluginSettings({
     },
     digestHours: {
         type: OptionType.NUMBER,
-        description: "右键「整理此人发言」时回溯多少小时",
+        description: "右键「整理此人发言」时回溯多少小时（增量模式下仅首次生效）",
         default: 24
+    },
+    digestIncremental: {
+        type: OptionType.BOOLEAN,
+        description: "增量模式：只整理「上次整理之后」的发言，避免相邻两次大面积重叠",
+        default: false
     }
 });
 
@@ -303,6 +308,8 @@ async function persist() {
 
 // ── 24 小时发言整理（右键用户触发）─────────────────────────────────
 
+const LAST_DIGEST_KEY = "AdminPing_lastDigestAt";
+
 let digestRunning = false;
 
 function currentHours(): number {
@@ -318,10 +325,34 @@ async function runDigest(user: any) {
     digestRunning = true;
     const hours = currentHours();
     const name: string = user.globalName ?? user.username ?? user.id;
+    const incremental = !!settings.store.digestIncremental;
 
     try {
-        showToast(`开始整理 ${name} 最近 ${hours} 小时的发言…（要遍历服务器，可能要等十几秒）`);
-        const r = await exportUserDigest({ id: user.id, name }, hours);
+        let sinceTs: number | undefined;
+        if (incremental) {
+            try {
+                const last = await DataStore.get<number>(LAST_DIGEST_KEY);
+                if (typeof last === "number" && last > 0) {
+                    sinceTs = last;
+                    const d = new Date(last);
+                    showToast(`增量模式：从 ${d.toLocaleString()} 开始整理 ${name} 的发言…`);
+                } else {
+                    showToast(`增量模式首次运行，先按最近 ${hours} 小时整理 ${name} 的发言…`);
+                }
+            } catch { /* 读不到就当首次 */ }
+        } else {
+            showToast(`开始整理 ${name} 最近 ${hours} 小时的发言…（要遍历服务器，可能要等十几秒）`);
+        }
+
+        const r = await exportUserDigest({ id: user.id, name }, hours, undefined, sinceTs);
+
+        // 记下本次的结束时间，作为下次增量起点
+        try {
+            await DataStore.set(LAST_DIGEST_KEY, r.endTs);
+        } catch (e) {
+            logger.warn("保存增量起点失败:", e);
+        }
+
         showToast(`✅ 整理完成：${r.count} 条，其中 ${r.quoted} 条带引用 → 已存到桌面`);
     } catch (e) {
         logger.error("整理失败:", e);
@@ -331,15 +362,38 @@ async function runDigest(user: any) {
     }
 }
 
+async function resetDigestBaseline() {
+    try {
+        await DataStore.set(LAST_DIGEST_KEY, 0);
+        showToast("已重置增量起点，下次整理会按「最近 N 小时」重新开始");
+    } catch (e) {
+        logger.error("重置增量起点失败:", e);
+    }
+}
+
 const userContextPatch: NavContextMenuPatchCallback = (children, { user }: any) => {
     if (!user?.id) return;
+    const incremental = !!settings.store.digestIncremental;
+
     children.push(
         <Menu.MenuItem
             id="vc-adminping-digest"
-            label={`整理此人最近 ${currentHours()} 小时发言（导出 HTML）`}
+            label={incremental
+                ? "整理此人自上次以来的发言（导出 HTML）"
+                : `整理此人最近 ${currentHours()} 小时发言（导出 HTML）`}
             action={() => runDigest(user)}
         />
     );
+
+    if (incremental) {
+        children.push(
+            <Menu.MenuItem
+                id="vc-adminping-digest-reset"
+                label="重置增量起点"
+                action={() => resetDigestBaseline()}
+            />
+        );
+    }
 };
 
 // ── 插件 ────────────────────────────────────────────────────────────

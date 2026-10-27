@@ -210,7 +210,7 @@ async function resolveRef(msg: any, guildId: string): Promise<DigestItem["ref"]>
     };
 }
 
-function buildDigestHtml(user: { name: string; id: string; }, items: DigestItem[], hours: number): string {
+function buildDigestHtml(user: { name: string; id: string; }, items: DigestItem[], startTs: number, modeLabel: string): string {
     const now = new Date();
     const p = (n: number) => String(n).padStart(2, "0");
     const stamp = `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())} ${p(now.getHours())}:${p(now.getMinutes())}`;
@@ -275,15 +275,15 @@ function buildDigestHtml(user: { name: string; id: string; }, items: DigestItem[
 <body>
 <div class="wrap">
   <header>
-    <h1>${esc(user.name)} · 最近 ${hours} 小时发言整理</h1>
-    <div class="meta">统计区间：<b>${esc(fmtTime(Date.now() - hours * 3600_000))}</b> ~ <b>${stamp}</b> · 生成于 <b>${stamp}</b></div>
+    <h1>${esc(user.name)} · ${esc(modeLabel)}</h1>
+    <div class="meta">统计区间：<b>${esc(fmtTime(startTs))}</b> ~ <b>${stamp}</b> · 生成于 <b>${stamp}</b></div>
     <div class="stat">
       <div><span>发言条数</span><b>${items.length}</b></div>
       <div><span>带引用的</span><b>${quoted}</b></div>
       <div><span>涉及频道</span><b>${new Set(items.map(i => i.channelId)).size}</b></div>
     </div>
   </header>
-  ${items.length ? rows : `<div class="empty">最近 ${hours} 小时没有找到这个人的发言。</div>`}
+  ${items.length ? rows : `<div class="empty">这个区间内没有找到这个人的发言。</div>`}
   <footer>由 Vencord 插件 <code>AdminPing</code> 生成 · 数据来自 Discord 搜索接口，只包含你可见的频道</footer>
 </div>
 </body>
@@ -291,14 +291,26 @@ function buildDigestHtml(user: { name: string; id: string; }, items: DigestItem[
 }
 
 /**
- * 主入口：遍历该用户最近 N 小时的发言并导出 HTML 到桌面
+ * 主入口：遍历该用户发言并导出 HTML 到桌面
+ * @param user 目标用户
+ * @param hours 回溯小时数（sinceTs 为空时生效）
+ * @param onlyGuildId 只扫这个服务器
+ * @param sinceTs 增量起点（毫秒）。传了就忽略 hours，从这一刻开始算
  */
 export async function exportUserDigest(
     user: { id: string; name: string; },
     hours = 24,
-    onlyGuildId?: string
+    onlyGuildId?: string,
+    sinceTs?: number
 ) {
-    const minId = SnowflakeUtils.fromTimestamp(Date.now() - hours * 3600_000);
+    const endTs = Date.now();
+    const startTs = sinceTs && sinceTs < endTs ? sinceTs : endTs - hours * 3600_000;
+    const incremental = !!sinceTs;
+    const modeLabel = incremental
+        ? `自上次整理以来的发言`
+        : `最近 ${hours} 小时发言整理`;
+
+    const minId = SnowflakeUtils.fromTimestamp(startTs);
     const guilds = Object.values(GuildStore.getGuilds() ?? {}) as any[];
 
     const targets = guilds
@@ -312,7 +324,10 @@ export async function exportUserDigest(
         })
         .slice(0, MAX_GUILDS);
 
-    logger.info(`开始整理 ${user.name}（${user.id}）最近 ${hours} 小时，候选服务器 ${targets.length} 个`);
+    logger.info(
+        `开始整理 ${user.name}（${user.id}）${incremental ? "增量" : `最近 ${hours} 小时`}，`
+        + `起点 ${fmtTime(startTs)}，候选服务器 ${targets.length} 个`
+    );
 
     const all: any[] = [];
     for (let i = 0; i < targets.length; i++) {
@@ -332,7 +347,7 @@ export async function exportUserDigest(
         if (!m?.id || seen.has(m.id)) return false;
         seen.add(m.id);
         const ts = m.timestamp ? new Date(m.timestamp).getTime() : 0;
-        return ts >= Date.now() - hours * 3600_000;
+        return ts >= startTs;
     }).sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
 
     logger.info(`搜索命中 ${all.length} 条，去重过滤后 ${uniq.length} 条`);
@@ -360,12 +375,19 @@ export async function exportUserDigest(
         });
     }
 
-    const html = buildDigestHtml(user, items, hours);
+    const html = buildDigestHtml(user, items, startTs, modeLabel);
     const d = new Date();
     const p = (n: number) => String(n).padStart(2, "0");
-    const fileName = `Discord-发言整理-${user.name}-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}.html`;
+    const suffix = incremental ? "增量" : "";
+    const fileName = `Discord-发言整理${suffix}-${user.name}-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}.html`;
 
     const path = await Native.writeRecordFile(html, fileName);
     logger.info(`整理完成，已写入 ${path}`);
-    return { count: items.length, quoted: items.filter(i => i.ref).length, path };
+    return {
+        count: items.length,
+        quoted: items.filter(i => i.ref).length,
+        path,
+        startTs,
+        endTs
+    };
 }
