@@ -187,29 +187,21 @@ async function resolveRef(msg: any, guildId: string): Promise<DigestItem["ref"]>
         if (cached) return build(cached);
     } catch { /* ignore */ }
 
-    // 3) 单独请求（带重试）
+    // 3) 兜底：拉这个 id 周围的消息再挑出来。
+    //    注意：单条接口 GET /channels/{cid}/messages/{mid} 对用户账号恒返回
+    //    403 「只有机器人可使用此端点」(code 20002)，所以直接用 around，别浪费请求。
     let status: number | undefined;
-    try {
-        await sleep(REF_DELAY_MS);
-        const res = await getWithRetry(`/channels/${refChannelId}/messages/${ref.message_id}`);
-        if (res?.status === 200 && res.body) return build(res.body);
-        status = res?.status;
-        logger.warn(`引用单条拿不到 ${ref.message_id} status=${status}`);
-    } catch (e: any) {
-        status = e?.status;
-        logger.warn(`引用单条异常 ${ref.message_id} :: ${errInfo(e).text.slice(0, 160)}`);
-    }
-
-    // 4) 兜底：拉这个 id 周围的消息，从里面找（换个路由，有时单条接口不行但这个可以）
     try {
         await sleep(REF_DELAY_MS);
         const res = await getWithRetry(`/channels/${refChannelId}/messages`, { around: ref.message_id, limit: 5 });
         const list: any[] = Array.isArray(res?.body) ? res.body : [];
         const found = list.find(m => m?.id === ref.message_id);
         if (found) return build(found);
-        logger.warn(`引用 around 兜底也没找到 ${ref.message_id}（拿到 ${list.length} 条）`);
+        status = res?.status;
+        logger.warn(`引用 around 没找到 ${ref.message_id}（拿到 ${list.length} 条）status=${status}`);
     } catch (e: any) {
-        logger.warn(`引用 around 兜底异常 ${ref.message_id} :: ${errInfo(e).text.slice(0, 160)}`);
+        status = e?.status;
+        logger.warn(`引用 around 异常 ${ref.message_id} :: ${errInfo(e).text.slice(0, 160)}`);
     }
 
     return {
